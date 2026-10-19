@@ -1212,14 +1212,37 @@ fun VellumPeekPreviewSheet(
 
             HorizontalDivider(color = MaterialTheme.colorScheme.outline)
 
+            var peekWebView by remember { mutableStateOf<WebView?>(null) }
+            androidx.compose.runtime.DisposableEffect(peekSession.url) {
+                onDispose {
+                    runCatching {
+                        peekWebView?.stopLoading()
+                        peekWebView?.destroy()
+                    }
+                    peekWebView = null
+                }
+            }
+
             AndroidView(
                 factory = { ctx ->
                     WebView(ctx).apply {
+                        setLayerType(android.view.View.LAYER_TYPE_SOFTWARE, null)
                         settings.javaScriptEnabled = true
                         settings.domStorageEnabled = true
-                        webViewClient = WebViewClient()
+                        settings.mediaPlaybackRequiresUserGesture = true
+                        webViewClient = object : WebViewClient() {
+                            override fun onRenderProcessGone(
+                                view: WebView?,
+                                detail: android.webkit.RenderProcessGoneDetail?
+                            ): Boolean {
+                                runCatching { view?.destroy() }
+                                peekWebView = null
+                                onDismiss()
+                                return true
+                            }
+                        }
                         loadUrl(peekSession.url)
-                    }
+                    }.also { peekWebView = it }
                 },
                 modifier = Modifier.fillMaxSize()
             )

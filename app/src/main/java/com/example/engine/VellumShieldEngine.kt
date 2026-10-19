@@ -193,16 +193,27 @@ object VellumShieldEngine {
             path.endsWith(".jpg", true) ||
             path.endsWith(".webp", true)
 
+        val headers = mapOf(
+            "Access-Control-Allow-Origin" to "*",
+            "Cache-Control" to "no-store"
+        )
+
         val response = if (isImage) {
             WebResourceResponse(
                 "image/gif",
                 null,
+                200,
+                "OK",
+                headers,
                 ByteArrayInputStream(TRANSPARENT_GIF_BYTES)
             )
         } else {
             WebResourceResponse(
                 "text/plain",
                 "UTF-8",
+                200,
+                "OK",
+                headers,
                 ByteArrayInputStream(ByteArray(0))
             )
         }

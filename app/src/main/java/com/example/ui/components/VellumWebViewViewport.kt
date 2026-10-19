@@ -2,11 +2,14 @@ package com.example.ui.components
 
 import android.annotation.SuppressLint
 import android.graphics.Bitmap
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.DownloadListener
 import android.webkit.JavascriptInterface
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.URLUtil
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -33,10 +36,15 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -45,8 +53,7 @@ import com.example.engine.VellumShieldEngine
 import com.example.viewmodel.BrowserTab
 import com.example.viewmodel.BrowserViewModel
 import com.example.viewmodel.WebViewCommand
-
-private const val MAX_ACTIVE_WEBVIEWS = 3
+import kotlin.math.abs
 
 private const val DESKTOP_USER_AGENT =
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -82,259 +89,45 @@ fun VellumWebViewViewport(
     webViewCommand: WebViewCommand?,
     modifier: Modifier = Modifier
 ) {
-    val context = LocalContext.current
     val mainHandler = remember { Handler(Looper.getMainLooper()) }
 
-    // Maintain an LRU pool of up to 3 WebViews keyed by tabId so memory stays bounded
-    val webViewPool = remember { LinkedHashMap<String, WebView>(MAX_ACTIVE_WEBVIEWS, 0.75f, true) }
-    val lastLoadedUrlByTab = remember { mutableMapOf<String, String>() }
+    // Keep updated state references so WebViewClient/WebChromeClient never need to be recreated mid-load
+    val currentTabState by rememberUpdatedState(activeTab)
+    val currentHideCookies by rememberUpdatedState(hideCookieBanners)
+    val currentStripParams by rememberUpdatedState(stripTrackingParams)
+    val currentViewModel by rememberUpdatedState(viewModel)
 
-    DisposableEffect(Unit) {
+    // Generation counter to seamlessly recover if the Android emulator kills the WebView renderer process
+    var rendererGeneration by remember(activeTab.id) { mutableIntStateOf(0) }
+    var webViewRef by remember(activeTab.id, rendererGeneration) { mutableStateOf<WebView?>(null) }
+    var lastLoadedUrl by remember(activeTab.id, rendererGeneration) { mutableStateOf("") }
+    var lastAppliedDesktopMode by remember(activeTab.id, rendererGeneration) { mutableStateOf<Boolean?>(null) }
+
+    DisposableEffect(activeTab.id, rendererGeneration) {
         onDispose {
-            webViewPool.values.forEach { wv ->
-                runCatching { wv.destroy() }
-            }
-            webViewPool.clear()
-        }
-    }
-
-    val currentWebView = remember(activeTab.id) {
-        val existing = webViewPool[activeTab.id]
-        if (existing != null) {
-            existing
-        } else {
-            // Evict oldest WebView if pool exceeds MAX_ACTIVE_WEBVIEWS
-            if (webViewPool.size >= MAX_ACTIVE_WEBVIEWS) {
-                val eldestKey = webViewPool.entries.firstOrNull()?.key
-                if (eldestKey != null) {
-                    val evicted = webViewPool.remove(eldestKey)
-                    lastLoadedUrlByTab.remove(eldestKey)
-                    runCatching { evicted?.destroy() }
+            val wv = webViewRef
+            webViewRef = null
+            if (wv != null) {
+                runCatching {
+                    (wv.parent as? ViewGroup)?.removeView(wv)
+                    wv.stopLoading()
+                    wv.webChromeClient = null
+                    wv.destroy()
                 }
-            }
-            WebView(context).apply {
-                settings.apply {
-                    javaScriptEnabled = true
-                    domStorageEnabled = true
-                    databaseEnabled = true
-                    loadsImagesAutomatically = true
-                    mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
-                    useWideViewPort = true
-                    loadWithOverviewMode = true
-                    builtInZoomControls = true
-                    displayZoomControls = false
-                    setSupportZoom(true)
-                    setSupportMultipleWindows(false) // Prevents malicious pop-under windows
-                    javaScriptCanOpenWindowsAutomatically = false
-                }
-                CookieManager.getInstance().setAcceptCookie(true)
-                CookieManager.getInstance().setAcceptThirdPartyCookies(this, false)
-
-                addJavascriptInterface(
-                    VellumJsBridge(
-                        mainHandler = mainHandler,
-                        onElementZapped = { selector ->
-                            viewModel.onElementZappedFromPage(selector)
-                        },
-                        onReaderExtracted = { title, byline, paragraphs ->
-                            viewModel.onReaderArticleExtractedFromDom(title, byline, paragraphs)
-                        }
-                    ),
-                    "VellumBridge"
-                )
-
-                // Long-press link for Vellum Peek Preview
-                setOnLongClickListener { view ->
-                    val wv = view as? WebView ?: return@setOnLongClickListener false
-                    val hitResult = wv.hitTestResult
-                    val extra = hitResult.extra
-                    if ((hitResult.type == WebView.HitTestResult.SRC_ANCHOR_TYPE ||
-                            hitResult.type == WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE) &&
-                        !extra.isNullOrBlank()
-                    ) {
-                        viewModel.openPeekPreview(extra)
-                        true
-                    } else {
-                        false
-                    }
-                }
-
-                // File Download Handler -> Vellum Downloads Vault
-                setDownloadListener(
-                    DownloadListener { url, _, contentDisposition, mimeType, contentLength ->
-                        val fileName = URLUtil.guessFileName(url, contentDisposition, mimeType)
-                        viewModel.recordFileDownload(
-                            fileName = fileName,
-                            url = url,
-                            mimeType = mimeType ?: "application/octet-stream",
-                            contentLength = contentLength
-                        )
-                    }
-                )
-            }.also { created ->
-                webViewPool[activeTab.id] = created
             }
         }
     }
 
-    // Keep WebViewClient & WebChromeClient updated with current tab + shield rules
-    LaunchedEffect(activeTab.id, activeTab.domain, activeTab.isDesktopMode, hideCookieBanners, stripTrackingParams) {
-        val defaultUa = WebSettings.getDefaultUserAgent(context)
-        currentWebView.settings.userAgentString = if (activeTab.isDesktopMode) {
-            DESKTOP_USER_AGENT
-        } else {
-            defaultUa
-        }
-
-        currentWebView.webViewClient = object : WebViewClient() {
-
-            override fun shouldInterceptRequest(
-                view: WebView?,
-                request: WebResourceRequest?
-            ): WebResourceResponse? {
-                val reqUri = request?.url ?: return null
-                // Never block top-level main frame navigation
-                if (request.isForMainFrame) return null
-
-                val pageDomain = activeTab.domain
-                val shieldEnabled = viewModel.isShieldEnabledForDomain(pageDomain)
-                val strictMode = viewModel.isStrictModeForDomain(pageDomain)
-
-                val decision = VellumShieldEngine.evaluateNetworkRequest(
-                    requestUri = reqUri,
-                    pageUrl = activeTab.url,
-                    shieldEnabled = shieldEnabled,
-                    strictMode = strictMode
-                )
-
-                if (decision.shouldBlock) {
-                    mainHandler.post {
-                        viewModel.onRequestBlocked(
-                            tabId = activeTab.id,
-                            matchedDomain = decision.matchedDomain,
-                            category = decision.category
-                        )
-                    }
-                    return decision.response
-                }
-                return super.shouldInterceptRequest(view, request)
-            }
-
-            override fun shouldOverrideUrlLoading(
-                view: WebView?,
-                request: WebResourceRequest?
-            ): Boolean {
-                val targetUri = request?.url ?: return false
-                val targetUrl = targetUri.toString()
-
-                if (targetUrl.startsWith("vellum://shield-test", ignoreCase = true)) {
-                    viewModel.navigateToInput("vellum://shield-test")
-                    return true
-                }
-
-                if (stripTrackingParams && targetUrl.contains("?")) {
-                    val sanitized = UrlSanitizerAndSearch.sanitizeUrl(targetUrl)
-                    if (sanitized.strippedParamsCount > 0 && sanitized.finalUrl != targetUrl) {
-                        view?.loadUrl(sanitized.finalUrl)
-                        viewModel.showBanner("Stripped ${sanitized.strippedParamsCount} tracking param(s)")
-                        return true
-                    }
-                }
-                return false
-            }
-
-            override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
-                super.onPageStarted(view, url, favicon)
-                val effectiveUrl = if (lastLoadedUrlByTab[activeTab.id] == "vellum://shield-test") {
-                    "vellum://shield-test"
-                } else {
-                    url.orEmpty()
-                }
-                viewModel.onTabUrlAndStateUpdated(
-                    tabId = activeTab.id,
-                    url = effectiveUrl,
-                    title = view?.title,
-                    isLoading = true,
-                    progress = 20,
-                    canGoBack = view?.canGoBack() == true,
-                    canGoForward = view?.canGoForward() == true
-                )
-            }
-
-            override fun onPageCommitVisible(view: WebView?, url: String?) {
-                super.onPageCommitVisible(view, url)
-                injectCosmeticShield(view)
-            }
-
-            override fun onPageFinished(view: WebView?, url: String?) {
-                super.onPageFinished(view, url)
-                injectCosmeticShield(view)
-                val effectiveUrl = if (lastLoadedUrlByTab[activeTab.id] == "vellum://shield-test") {
-                    "vellum://shield-test"
-                } else {
-                    url.orEmpty()
-                }
-                viewModel.onTabUrlAndStateUpdated(
-                    tabId = activeTab.id,
-                    url = effectiveUrl,
-                    title = view?.title,
-                    isLoading = false,
-                    progress = 100,
-                    canGoBack = view?.canGoBack() == true,
-                    canGoForward = view?.canGoForward() == true
-                )
-                viewModel.onPageFinishedRecordHistory(
-                    tabId = activeTab.id,
-                    url = effectiveUrl,
-                    title = view?.title
-                )
-            }
-
-            private fun injectCosmeticShield(view: WebView?) {
-                val domain = activeTab.domain
-                val shieldOn = viewModel.isShieldEnabledForDomain(domain)
-                val zapped = viewModel.getZappedSelectorsForDomain(domain)
-                val script = VellumShieldEngine.buildCosmeticInjectionScript(
-                    shieldEnabled = shieldOn,
-                    hideCookieBanners = hideCookieBanners,
-                    customZappedSelectors = zapped
-                )
-                if (script.isNotBlank()) {
-                    view?.evaluateJavascript(script, null)
-                }
-            }
-        }
-
-        currentWebView.webChromeClient = object : WebChromeClient() {
-            override fun onProgressChanged(view: WebView?, newProgress: Int) {
-                super.onProgressChanged(view, newProgress)
-                val effectiveUrl = if (lastLoadedUrlByTab[activeTab.id] == "vellum://shield-test") {
-                    "vellum://shield-test"
-                } else {
-                    view?.url ?: activeTab.url
-                }
-                viewModel.onTabUrlAndStateUpdated(
-                    tabId = activeTab.id,
-                    url = effectiveUrl,
-                    title = view?.title,
-                    isLoading = newProgress < 100,
-                    progress = newProgress,
-                    canGoBack = view?.canGoBack() == true,
-                    canGoForward = view?.canGoForward() == true
-                )
-            }
-        }
-    }
-
-    // Trigger URL loading when activeTab.url changes
-    LaunchedEffect(activeTab.id, activeTab.url) {
+    // Load URL when activeTab.url changes without re-creating WebViewClient mid-flight
+    LaunchedEffect(webViewRef, activeTab.url, rendererGeneration) {
+        val wv = webViewRef ?: return@LaunchedEffect
         val targetUrl = activeTab.url
-        if (targetUrl.isNotBlank() && lastLoadedUrlByTab[activeTab.id] != targetUrl) {
-            lastLoadedUrlByTab[activeTab.id] = targetUrl
+        if (targetUrl.isNotBlank() && lastLoadedUrl != targetUrl) {
+            lastLoadedUrl = targetUrl
             if (targetUrl == "vellum://shield-test") {
-                val shieldOn = viewModel.isShieldEnabledForDomain("vellum://shield-test")
+                val shieldOn = currentViewModel.isShieldEnabledForDomain("vellum://shield-test")
                 val html = VellumShieldEngine.buildShieldTestBenchHtml(shieldOn)
-                currentWebView.loadDataWithBaseURL(
+                wv.loadDataWithBaseURL(
                     "https://vellum.diagnostic.local/",
                     html,
                     "text/html",
@@ -342,39 +135,52 @@ fun VellumWebViewViewport(
                     null
                 )
             } else {
-                currentWebView.loadUrl(targetUrl)
+                wv.loadUrl(targetUrl)
             }
         }
     }
 
+    // Apply Desktop User-Agent only when desktop mode explicitly changes
+    LaunchedEffect(webViewRef, activeTab.isDesktopMode) {
+        val wv = webViewRef ?: return@LaunchedEffect
+        if (lastAppliedDesktopMode != null && lastAppliedDesktopMode != activeTab.isDesktopMode) {
+            val defaultUa = WebSettings.getDefaultUserAgent(wv.context)
+            wv.settings.userAgentString = if (activeTab.isDesktopMode) DESKTOP_USER_AGENT else defaultUa
+            wv.reload()
+        }
+        lastAppliedDesktopMode = activeTab.isDesktopMode
+    }
+
     // Activate or deactivate Zap Distraction element picker in the live DOM
-    LaunchedEffect(isZapModeActive, activeTab.id) {
+    LaunchedEffect(webViewRef, isZapModeActive) {
+        val wv = webViewRef ?: return@LaunchedEffect
         val script = VellumShieldEngine.buildZapModeActivationScript(isZapModeActive)
-        currentWebView.evaluateJavascript(script, null)
+        runCatching { wv.evaluateJavascript(script, null) }
     }
 
     // Handle explicit WebView commands (Back, Forward, Reload, Reader extraction, Find in page)
-    LaunchedEffect(webViewCommand) {
+    LaunchedEffect(webViewRef, webViewCommand) {
+        val wv = webViewRef ?: return@LaunchedEffect
         when (val cmd = webViewCommand) {
             is WebViewCommand.GoBack -> {
-                if (currentWebView.canGoBack()) {
-                    currentWebView.goBack()
+                if (wv.canGoBack()) {
+                    wv.goBack()
                 } else {
-                    viewModel.returnToStartPage()
+                    currentViewModel.returnToStartPage()
                 }
-                viewModel.consumeWebViewCommand()
+                currentViewModel.consumeWebViewCommand()
             }
             is WebViewCommand.GoForward -> {
-                if (currentWebView.canGoForward()) {
-                    currentWebView.goForward()
+                if (wv.canGoForward()) {
+                    wv.goForward()
                 }
-                viewModel.consumeWebViewCommand()
+                currentViewModel.consumeWebViewCommand()
             }
             is WebViewCommand.Reload -> {
-                if (activeTab.url == "vellum://shield-test") {
-                    val shieldOn = viewModel.isShieldEnabledForDomain("vellum://shield-test")
+                if (currentTabState.url == "vellum://shield-test") {
+                    val shieldOn = currentViewModel.isShieldEnabledForDomain("vellum://shield-test")
                     val html = VellumShieldEngine.buildShieldTestBenchHtml(shieldOn)
-                    currentWebView.loadDataWithBaseURL(
+                    wv.loadDataWithBaseURL(
                         "https://vellum.diagnostic.local/",
                         html,
                         "text/html",
@@ -382,45 +188,302 @@ fun VellumWebViewViewport(
                         null
                     )
                 } else {
-                    currentWebView.reload()
+                    wv.reload()
                 }
-                viewModel.consumeWebViewCommand()
+                currentViewModel.consumeWebViewCommand()
             }
             is WebViewCommand.ExtractReaderArticle -> {
-                currentWebView.evaluateJavascript(
+                wv.evaluateJavascript(
                     VellumShieldEngine.buildReaderExtractionScript(),
                     null
                 )
-                viewModel.consumeWebViewCommand()
+                currentViewModel.consumeWebViewCommand()
             }
             is WebViewCommand.FindText -> {
                 if (cmd.query.isNotBlank()) {
-                    currentWebView.findAllAsync(cmd.query)
+                    wv.findAllAsync(cmd.query)
                 } else {
-                    currentWebView.clearMatches()
+                    wv.clearMatches()
                 }
-                viewModel.consumeWebViewCommand()
+                currentViewModel.consumeWebViewCommand()
             }
             is WebViewCommand.FindNext -> {
-                currentWebView.findNext(cmd.forward)
-                viewModel.consumeWebViewCommand()
+                wv.findNext(cmd.forward)
+                currentViewModel.consumeWebViewCommand()
             }
             is WebViewCommand.ClearFind -> {
-                currentWebView.clearMatches()
-                viewModel.consumeWebViewCommand()
+                wv.clearMatches()
+                currentViewModel.consumeWebViewCommand()
             }
             null -> Unit
         }
     }
 
     Box(modifier = modifier.fillMaxSize()) {
-        AndroidView(
-            factory = { currentWebView },
-            update = { /* Managed via LaunchedEffects to avoid redundant recomposition reloads */ },
-            modifier = Modifier
-                .fillMaxSize()
-                .testTag("browser_webview")
-        )
+        key(activeTab.id, rendererGeneration) {
+            AndroidView(
+                factory = { ctx ->
+                    WebView(ctx).apply {
+                        layoutParams = ViewGroup.LayoutParams(
+                            ViewGroup.LayoutParams.MATCH_PARENT,
+                            ViewGroup.LayoutParams.MATCH_PARENT
+                        )
+                        // Use software layer rendering and block autoplay video surfaces to prevent
+                        // Chromium ImageReaderGLOwner hardware buffer exhaustion in virtualized GPUs
+                        setLayerType( android.view.View.LAYER_TYPE_SOFTWARE, null)
+                        settings.apply {
+                            javaScriptEnabled = true
+                            domStorageEnabled = true
+                            databaseEnabled = true
+                            loadsImagesAutomatically = true
+                            mediaPlaybackRequiresUserGesture = true
+                            mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+                            useWideViewPort = true
+                            loadWithOverviewMode = true
+                            builtInZoomControls = true
+                            displayZoomControls = false
+                            setSupportZoom(true)
+                            setSupportMultipleWindows(false)
+                            javaScriptCanOpenWindowsAutomatically = false
+                            if (currentTabState.isDesktopMode) {
+                                userAgentString = DESKTOP_USER_AGENT
+                            }
+                        }
+
+                        runCatching {
+                            CookieManager.getInstance().setAcceptCookie(true)
+                            CookieManager.getInstance().setAcceptThirdPartyCookies(this, false)
+                        }
+
+                        addJavascriptInterface(
+                            VellumJsBridge(
+                                mainHandler = mainHandler,
+                                onElementZapped = { selector ->
+                                    currentViewModel.onElementZappedFromPage(selector)
+                                },
+                                onReaderExtracted = { title, byline, paragraphs ->
+                                    currentViewModel.onReaderArticleExtractedFromDom(title, byline, paragraphs)
+                                }
+                            ),
+                            "VellumBridge"
+                        )
+
+                        setOnLongClickListener { view ->
+                            val hitView = view as? WebView ?: return@setOnLongClickListener false
+                            val hitResult = hitView.hitTestResult
+                            val extra = hitResult.extra
+                            if ((hitResult.type == WebView.HitTestResult.SRC_ANCHOR_TYPE ||
+                                    hitResult.type == WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE) &&
+                                !extra.isNullOrBlank()
+                            ) {
+                                currentViewModel.openPeekPreview(extra)
+                                true
+                            } else {
+                                false
+                            }
+                        }
+
+                        setDownloadListener(
+                            DownloadListener { url, _, contentDisposition, mimeType, contentLength ->
+                                val fileName = URLUtil.guessFileName(url, contentDisposition, mimeType)
+                                currentViewModel.recordFileDownload(
+                                    fileName = fileName,
+                                    url = url,
+                                    mimeType = mimeType ?: "application/octet-stream",
+                                    contentLength = contentLength
+                                )
+                            }
+                        )
+
+                        webViewClient = object : WebViewClient() {
+
+                            override fun shouldInterceptRequest(
+                                view: WebView?,
+                                request: WebResourceRequest?
+                            ): WebResourceResponse? {
+                                val reqUri = request?.url ?: return null
+                                if (request.isForMainFrame) return null
+
+                                val tabSnapshot = currentTabState
+                                val pageDomain = tabSnapshot.domain
+                                val shieldEnabled = currentViewModel.isShieldEnabledForDomain(pageDomain)
+                                val strictMode = currentViewModel.isStrictModeForDomain(pageDomain)
+
+                                val decision = VellumShieldEngine.evaluateNetworkRequest(
+                                    requestUri = reqUri,
+                                    pageUrl = tabSnapshot.url,
+                                    shieldEnabled = shieldEnabled,
+                                    strictMode = strictMode
+                                )
+
+                                if (decision.shouldBlock) {
+                                    mainHandler.post {
+                                        currentViewModel.onRequestBlocked(
+                                            tabId = tabSnapshot.id,
+                                            matchedDomain = decision.matchedDomain,
+                                            category = decision.category
+                                        )
+                                    }
+                                    return decision.response
+                                }
+                                return super.shouldInterceptRequest(view, request)
+                            }
+
+                            override fun shouldOverrideUrlLoading(
+                                view: WebView?,
+                                request: WebResourceRequest?
+                            ): Boolean {
+                                val targetUri = request?.url ?: return false
+                                val targetUrl = targetUri.toString()
+
+                                if (targetUrl.startsWith("vellum://shield-test", ignoreCase = true)) {
+                                    currentViewModel.navigateToInput("vellum://shield-test")
+                                    return true
+                                }
+
+                                if (currentStripParams && targetUrl.contains("?")) {
+                                    val sanitized = UrlSanitizerAndSearch.sanitizeUrl(targetUrl)
+                                    if (sanitized.strippedParamsCount > 0 && sanitized.finalUrl != targetUrl) {
+                                        lastLoadedUrl = sanitized.finalUrl
+                                        view?.loadUrl(sanitized.finalUrl)
+                                        currentViewModel.showBanner(
+                                            "Stripped ${sanitized.strippedParamsCount} tracking param(s)"
+                                        )
+                                        return true
+                                    }
+                                }
+                                return false
+                            }
+
+                            override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                                super.onPageStarted(view, url, favicon)
+                                val tabSnapshot = currentTabState
+                                val effectiveUrl = if (lastLoadedUrl == "vellum://shield-test") {
+                                    "vellum://shield-test"
+                                } else {
+                                    url.orEmpty()
+                                }
+                                if (effectiveUrl.isNotBlank()) {
+                                    lastLoadedUrl = effectiveUrl
+                                }
+                                currentViewModel.onTabUrlAndStateUpdated(
+                                    tabId = tabSnapshot.id,
+                                    url = effectiveUrl,
+                                    title = view?.title,
+                                    isLoading = true,
+                                    progress = 20,
+                                    canGoBack = view?.canGoBack() == true,
+                                    canGoForward = view?.canGoForward() == true
+                                )
+                            }
+
+                            override fun onPageCommitVisible(view: WebView?, url: String?) {
+                                super.onPageCommitVisible(view, url)
+                                injectCosmeticShield(view)
+                            }
+
+                            override fun onPageFinished(view: WebView?, url: String?) {
+                                super.onPageFinished(view, url)
+                                injectCosmeticShield(view)
+                                val tabSnapshot = currentTabState
+                                val effectiveUrl = if (lastLoadedUrl == "vellum://shield-test") {
+                                    "vellum://shield-test"
+                                } else {
+                                    url.orEmpty()
+                                }
+                                currentViewModel.onTabUrlAndStateUpdated(
+                                    tabId = tabSnapshot.id,
+                                    url = effectiveUrl,
+                                    title = view?.title,
+                                    isLoading = false,
+                                    progress = 100,
+                                    canGoBack = view?.canGoBack() == true,
+                                    canGoForward = view?.canGoForward() == true
+                                )
+                                currentViewModel.onPageFinishedRecordHistory(
+                                    tabId = tabSnapshot.id,
+                                    url = effectiveUrl,
+                                    title = view?.title
+                                )
+                            }
+
+                            /**
+                             * Crucial handler for Android 8.0+ (API 26+):
+                             * Prevents Chromium's aw_browser_terminator from crashing the host app
+                             * if the system or emulator terminates the sandboxed renderer process,
+                             * and seamlessly recovers the WebView instance.
+                             */
+                            override fun onRenderProcessGone(
+                                view: WebView?,
+                                detail: RenderProcessGoneDetail?
+                            ): Boolean {
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                    runCatching {
+                                        (view?.parent as? ViewGroup)?.removeView(view)
+                                        view?.destroy()
+                                    }
+                                    webViewRef = null
+                                    lastLoadedUrl = ""
+                                    mainHandler.post {
+                                        rendererGeneration += 1
+                                    }
+                                    return true
+                                }
+                                return true
+                            }
+
+                            private fun injectCosmeticShield(view: WebView?) {
+                                val tabSnapshot = currentTabState
+                                val domain = tabSnapshot.domain
+                                val shieldOn = currentViewModel.isShieldEnabledForDomain(domain)
+                                val zapped = currentViewModel.getZappedSelectorsForDomain(domain)
+                                val script = VellumShieldEngine.buildCosmeticInjectionScript(
+                                    shieldEnabled = shieldOn,
+                                    hideCookieBanners = currentHideCookies,
+                                    customZappedSelectors = zapped
+                                )
+                                if (script.isNotBlank()) {
+                                    runCatching { view?.evaluateJavascript(script, null) }
+                                }
+                            }
+                        }
+
+                        webChromeClient = object : WebChromeClient() {
+                            private var lastReportedProgress = 0
+
+                            override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                                super.onProgressChanged(view, newProgress)
+                                // Throttle progress updates to avoid 60fps state churn during page load
+                                if (newProgress == 100 || abs(newProgress - lastReportedProgress) >= 12) {
+                                    lastReportedProgress = newProgress
+                                    val tabSnapshot = currentTabState
+                                    val effectiveUrl = if (lastLoadedUrl == "vellum://shield-test") {
+                                        "vellum://shield-test"
+                                    } else {
+                                        view?.url ?: tabSnapshot.url
+                                    }
+                                    currentViewModel.onTabUrlAndStateUpdated(
+                                        tabId = tabSnapshot.id,
+                                        url = effectiveUrl,
+                                        title = view?.title,
+                                        isLoading = newProgress < 100,
+                                        progress = newProgress,
+                                        canGoBack = view?.canGoBack() == true,
+                                        canGoForward = view?.canGoForward() == true
+                                    )
+                                }
+                            }
+                        }
+                    }.also { created ->
+                        webViewRef = created
+                    }
+                },
+                update = { /* State updates are handled cleanly via LaunchedEffects */ },
+                modifier = Modifier
+                    .fillMaxSize()
+                    .testTag("browser_webview")
+            )
+        }
 
         // Floating HUD Banner when Zap Distraction Mode is active
         if (isZapModeActive) {
